@@ -1,0 +1,246 @@
+close all;clear;format compact;
+addpath(genpath('=VU 3D model='));
+
+%% restore old matlab colormap and hold function
+addpath(genpath('fix hold'));% hold function is adapted (see hold function current folder) such that the color order index is not reset (new plot starts with blue again)
+set(groot,'defaultAxesColorOrder',[0 0 1;0 0.5 0;1 0 0;0 0.75 0.75;0.75 0 0.75;0.75 0.75 0;0.25 0.25 0.25])
+
+%% Default plot settings (you can chnge these)
+set(0,'defaultLineLineWidth',1.5);
+set(0,'defaultAxesLineWidth',1.5)
+set(0,'defaultAxesFontSize',12)
+
+%% Load settings from excel sheet
+settings                  = xlsreadsettings('Settings_Basketball.xls');
+settings.data_path        = ['raw data', filesep]; %location of the data
+settings.file_prefix      = 'TN000'; 
+settings.file_extension   = '.ndf';
+settings.pointer_file     = 'RB-06114.RIG';
+settings.pointer_kol      = 13:18;
+% filter settings
+settings.filter_on                  = 1;   %1=on 0=off
+settings.sample_frequency_opto      = 100;
+settings.sample_frequency_fp        = 800;
+settings.cutoff_frequency           = 30;
+settings.maximum_interlopation_gap  = 0;
+% pointer trial numbers
+settings.reference_trial_nr     = 89; 
+settings.cluster_pointer_nr     = 78:88; 
+settings.forceplate_pointers_nr = 12:16;
+
+%% calculation of bony landmarks (BLMs) with respect to marker clusters using on pointer trials
+BLM = pointer2blm(settings.cluster_pointer_nr,settings.reference_trial_nr,settings.data_path,settings);
+BLM.segment(2).blm_name = {'LM','SPH','LFE','MFE'};
+plot_3d(BLM);
+
+%% Calculating anatomical coordinate systems based during calibration posture
+CP  = blm2cp(BLM); %CP = calibration posture
+plot_3d(CP);
+
+%% Calculating forceplate position/orientation based on forceplate pointers
+FPpos           = pointer2FPpos(settings.forceplate_pointers_nr,settings.data_path,settings,0); %forceplate pointers
+SO(1).points    = FPpos.corners;
+SO(1).R         = FPpos.R;
+SO(1).object    = 1;
+plot_3d(CP,SO);
+
+%% Calculate Calf coordinate system (ACSs) and inertial parameters in the cell below
+
+
+shank_BLM = CP.segment(2).blm;
+
+%Calculate JCs
+
+LM            =shank_BLM(:,1:3);% Lateral Malleolus 
+SPH           =shank_BLM(:,4:6);% Medial Malleolus
+LFE           =shank_BLM(:,7:9);%Lateral Femur Epicondyle
+MFE           =shank_BLM(:,10:12);%Medial Femur Epicondyle
+
+AJC = (LM+SPH)/2;
+KJC = (LFE+MFE)/2;
+
+%Construct shank ACS
+
+z_axis      = KJC - AJC;
+y_axis_temp = MFE - LFE;
+x_axis      = cross(y_axis_temp, z_axis);
+y_axis      = cross(z_axis, x_axis);
+x_axis = x_axis/norm(x_axis);%make axis length one
+y_axis = y_axis/norm(y_axis);%make axis length one
+z_axis = z_axis/norm(z_axis);%make axis length one
+gRseg=[x_axis y_axis z_axis];
+
+
+
+CP.segment(2).joint = [AJC  KJC];
+%CP.segment(2).joint_name = ['AJC',  'KJC'];
+
+CP.segment(2).R = gRseg;
+plot_3d(CP);
+
+%(Write here your code for: Step 2 Building your own anatomical function )
+
+segm_length= norm(KJC-AJC)*100;%m->cm
+
+regression_parameters = [5.85 8.77 8.44 1.44];
+segm_length_bi        = segm_length * 434/393.4%male
+circ                  = CP.segment(2).circ;
+
+[m,Ixx,Iyy,Izz]=calc_zatsiorski_inertial_parameters(regression_parameters,segm_length_bi,circ);
+
+%Construction of Inertial Tensor
+segIzat = [Ixx 0 0 0 Iyy 0 0 0 Izz];%kg*cm^2
+segIzat=segIzat/10000;%kg*cm^2-->kg*m^2 (divide by 100^2=10.000)
+% post multiplication with rotation martix: zie  Human kinetics (p286):gRseg*segIzat*gRseg'
+gIzat	=   prod_col(prod_col(gRseg, segIzat),transpose_col(gRseg));%kg*m^2
+
+CP.segment(2).mass = m;
+CP.segment(2).Iprincipal = [Ixx Iyy Izz];
+CP.segment(2).RI = gIzat;
+CP.segment(2).com = CP.segment(2).origin;
+
+plot_3d(CP);
+
+%% ------------------------------------------------------------------------
+settings.file_no    = 114;
+[x, y, z]           = load_optotrak_data(settings);
+[Fext, Mext, CoP]   = load_kistler_FP_data(settings,FPpos,x);
+traj                = trajcalc(CP,x,y,z);
+traj.segment(1).axis_function   = 'calc_foot_antro_zat';
+traj.segment(2).axis_function   = 'calc_calf_antro_zat';
+traj.BerendBotje    = 1;
+
+plot_3d(traj,SO,Fext,CoP,settings.sample_frequency_opto,[-1 1 0 1 -.3 1.5],[],Fext);
+
+%% calculate Ankle moments below
+
+fs                    = settings.sample_frequency_opto; %Sample frequency
+
+segm_length           = norm(traj.segment(1).joint(1,10) - traj.segment(1).joint(1,7))*100; %m->cm
+regression_parameters = [6.14 7.86 7.14 1.60];
+circ                  = traj.segment(1).circ;
+[m,Ixx,Iyy,Izz]       = calc_zatsiorski_inertial_parameters(regression_parameters,segm_length,circ);
+
+g_vector              = [0 0 -9.81]; %gravity vector
+g                     = repmat([0 0 -9.81], length(x) , 1); %step 2.a
+
+gRseg                 = traj.segment(1).R;
+
+[gOMEGAseg, segOMEGAseg] = angular_vel_3d(gRseg, fs); %step 2.b
+wi      = segOMEGAseg; %angular velocity vector of segment i
+
+%Construction of Inertial Tensor
+segIfoot= [Ixx 0 0 0 Iyy 0 0 0 Izz];%kg*cm^2
+segIfoot= segIfoot/10000;%kg*cm^2-->kg*m^2 (divide by 100^2=10.000)
+% post multiplication with rotation martix: zie  Human kinetics (p286):gRseg*segIzat*gRseg'
+Ii  	=   prod_col(prod_col(gRseg, segIfoot),transpose_col(gRseg));%Inertia tensor of segment i (kg*m^2)
+
+term_5  = calc_derivative(prod_col(Ii, wi),fs);
+
+ri      = traj.segment(1).com; %Vector to the COM of segment i (x-axis)
+ai      = calc_2nd_derivative(ri,fs); %Acceleration of the COM of segment i; step 2.c
+
+
+mi                    = traj.segment(1).mass; %mass of segment
+Fg                    = Fext; %Ground reaction force vector
+Mg                    = Mext; %Ground reaction moment measured by the force plate
+rg                    = CoP ; %Vector to the point of application of the GRF
+r_ankle               = traj.segment(1).joint(:,4:6); %Vector to the ankle joint
+
+
+
+
+%function_derivative=calc_derivative(signal,samplefrequency,spline_on)
+%Part 3 & 4 of Step 3
+term_1  = -Mg;
+plot_3d(traj,SO,Fext,CoP,settings.sample_frequency_opto,[-1 1 0 1 -.3 1.5],[],term_1,[],[],1);
+vline(215, 'k--');
+
+term_2  = - cross((rg-r_ankle), Fg);
+plot_3d(traj,SO,Fext,CoP,settings.sample_frequency_opto,[-1 1 0 1 -.3 1.5],[],term_2,[],[],1);
+vline(215, 'k--');
+
+term_3  = - cross((ri-r_ankle), (mi*g));
+plot_3d(traj,SO,Fext,CoP,settings.sample_frequency_opto,[-1 1 0 1 -.3 1.5],[],term_3,[],[],1);
+vline(215, 'k--');
+
+term_4  = cross((ri-r_ankle), (mi*ai));
+plot_3d(traj,SO,Fext,CoP,settings.sample_frequency_opto,[-1 1 0 1 -.3 1.5],[],term_4,[],[],1);
+vline(215, 'k--');
+
+term_5  = calc_derivative(prod_col(Ii, wi),fs);
+plot_3d(traj,SO,Fext,CoP,settings.sample_frequency_opto,[-1 1 0 1 -.3 1.5],[],term_5,[],[],1);
+vline(215, 'k--');
+
+M_ankle_foot = term_1 + term_2 + term_3 + term_4 + term_5; %M_ankle is the net moment at the ankle joint
+plot_3d(traj,SO,Fext,CoP,settings.sample_frequency_opto,[-1 1 0 1 -.3 1.5],[],M_ankle_foot,[],[],1);
+vline(215, 'k--');
+
+%Step 4
+
+fs                    = settings.sample_frequency_opto; %Sample frequency
+
+segm_length           = norm(traj.segment(1).joint(1,10) - traj.segment(1).joint(1,7))*100; %m->cm
+regression_parameters = [6.14 7.86 7.14 1.60];
+circ                  = traj.segment(1).circ;
+[m,Ixx,Iyy,Izz]       = calc_zatsiorski_inertial_parameters(regression_parameters,segm_length,circ);
+
+g_vector              = [0 0 -9.81]; %gravity vector
+g                     = repmat([0 0 -9.81], length(x) , 1); %step 2.a
+
+gRseg                 = traj.segment(1).R;
+
+[gOMEGAseg, segOMEGAseg] = angular_vel_3d(gRseg, fs); %step 2.b
+wi      = segOMEGAseg; %angular velocity vector of segment i
+
+%Construction of Inertial Tensor
+segIfoot= [Ixx 0 0 0 Iyy 0 0 0 Izz];%kg*cm^2
+segIfoot= segIfoot/10000;%kg*cm^2-->kg*m^2 (divide by 100^2=10.000)
+% post multiplication with rotation martix: zie  Human kinetics (p286):gRseg*segIzat*gRseg'
+Ii  	=   prod_col(prod_col(gRseg, segIfoot),transpose_col(gRseg));%Inertia tensor of segment i (kg*m^2)
+
+term_5  = calc_derivative(prod_col(Ii, wi),fs);
+
+ri      = traj.segment(1).com; %Vector to the COM of segment i (x-axis)
+ai      = calc_2nd_derivative(ri,fs); %Acceleration of the COM of segment i; step 2.c
+
+
+mi                    = traj.segment(1).mass; %mass of segment
+Fg                    = Fext; %Ground reaction force vector
+Mg                    = Mext; %Ground reaction moment measured by the force plate
+rg                    = CoP ; %Vector to the point of application of the GRF
+r_ankle               = traj.segment(2).joint(:,1:3); %Vector to the ankle joint
+
+
+
+
+%function_derivative=calc_derivative(signal,samplefrequency,spline_on)
+%Part 3 & 4 of Step 3
+term_1  = -Mg;
+plot_3d(traj,SO,Fext,CoP,settings.sample_frequency_opto,[-1 1 0 1 -.3 1.5],[],term_1);
+
+term_2  = - cross((rg-r_ankle), Fg);
+plot_3d(traj,SO,Fext,CoP,settings.sample_frequency_opto,[-1 1 0 1 -.3 1.5],[],term_2);
+
+term_3  = - cross((ri-r_ankle), (mi*g));
+plot_3d(traj,SO,Fext,CoP,settings.sample_frequency_opto,[-1 1 0 1 -.3 1.5],[],term_3);
+
+term_4  = cross((ri-r_ankle), (mi*ai));
+plot_3d(traj,SO,Fext,CoP,settings.sample_frequency_opto,[-1 1 0 1 -.3 1.5],[],term_4);
+
+term_5  = calc_derivative(prod_col(Ii, wi),fs);
+plot_3d(traj,SO,Fext,CoP,settings.sample_frequency_opto,[-1 1 0 1 -.3 1.5],[],term_5);
+
+M_ankle_shank = term_1 + term_2 + term_3 + term_4 + term_5; %M_ankle is the net moment at the ankle joint
+plot_3d(traj,SO,Fext,CoP,settings.sample_frequency_opto,[-1 1 0 1 -.3 1.5],[],M_ankle_shank);
+
+
+%Written Report
+plot_3d(traj,SO,Fext,CoP,settings.sample_frequency_opto,[-1 1 0 1 -.3 1.5],[],M_ankle_shank, M_ankle_foot,[],1);
+legend('M ankle shank', 'M ankle foot')
+
+figure
+plot(M_ankle_shank,'--')
+hold on
+plot(M_ankle_foot)
+legend('M ankle shank', 'M ankle foot')
